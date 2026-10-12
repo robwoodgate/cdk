@@ -13,12 +13,14 @@ const PROOF_INPUT: u8 = 0x11;
 const MINT_QUOTE_INPUT: u8 = 0x12;
 const BLINDED_OUTPUT: u8 = 0x21;
 const MELT_QUOTE_OUTPUT: u8 = 0x22;
+const CHANGE_QUOTE_OUTPUT: u8 = 0x23;
 const AUTHORIZED_REQUEST: u8 = 0xf1;
 
 /// Quote identity and amount bound by a transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Quote {
-    /// Mint quote face amount, or melt amount including selected fee reserve.
+    /// Amount a mint quote issues in this transaction, or melt amount including
+    /// the selected fee reserve.
     pub amount: Amount,
     /// Quote identifier exactly as supplied by the mint.
     pub id: String,
@@ -33,6 +35,24 @@ pub struct MintQuoteInput {
     pub id: String,
     /// The quote's lock key (NUT-04 `pubkey`), committed so a signer can tell which key the input needs.
     pub pubkey: PublicKey,
+}
+
+/// Change quote output bound by a transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeOutput {
+    /// Fixed amount, or `None` for the remainder quote that takes the balance.
+    pub amount: Option<Amount>,
+    /// Lock key of the change quote.
+    pub pubkey: bitcoin::secp256k1::PublicKey,
+    /// Preimage of the change quote's id.
+    pub id_preimage: [u8; 32],
+}
+
+impl ChangeOutput {
+    /// The change quote's NUT-04 derived id.
+    pub fn quote_id(&self) -> String {
+        super::derived_quote_id(&self.id_preimage)
+    }
 }
 
 /// Canonical transaction transcript and its input records.
@@ -52,8 +72,21 @@ impl Transaction {
         outputs: &[BlindedMessage],
         melt_quotes: &[Quote],
     ) -> Result<Self, Error> {
+        Self::with_change(proofs, mint_quotes, outputs, melt_quotes, &[])
+    }
+
+    /// [`Transaction::new`] with change quote outputs, at most one of them the remainder.
+    pub fn with_change(
+        proofs: &[Proof],
+        mint_quotes: &[MintQuoteInput],
+        outputs: &[BlindedMessage],
+        melt_quotes: &[Quote],
+        change: &[ChangeOutput],
+    ) -> Result<Self, Error> {
         if (proofs.is_empty() && mint_quotes.is_empty())
-            || (outputs.is_empty() && melt_quotes.is_empty())
+            || (outputs.is_empty() && melt_quotes.is_empty() && change.is_empty())
+            || change.iter().filter(|c| c.amount.is_none()).count() > 1
+            || change.iter().any(|c| c.amount == Some(Amount::ZERO))
         {
             return Err(Error::InvalidTransaction);
         }
@@ -118,6 +151,16 @@ impl Transaction {
                 ],
             )?);
         }
+        for output in change {
+            // The amount record is omitted entirely on the remainder quote.
+            let mut body = vec![];
+            if let Some(amount) = output.amount {
+                record(&mut body, 1, &integer(u64::from(amount)))?;
+            }
+            record(&mut body, 2, &output.pubkey.serialize())?;
+            record(&mut body, 3, output.quote_id().as_bytes())?;
+            record(&mut transcript, CHANGE_QUOTE_OUTPUT, &body)?;
+        }
         Ok(Self::from_parts(transcript, inputs))
     }
 
@@ -132,12 +175,42 @@ impl Transaction {
         let mut ys = HashSet::new();
         let mut quotes = HashSet::new();
         let mut output = false;
+        let mut remainder = false;
+        let mut change_ids = HashSet::new();
         for (tag, value, full) in records {
             if tag < last || !matches!(tag >> 4, 1 | 2) {
                 return Err(Error::InvalidTransaction);
             }
             last = tag;
             let fields = parse_records(value)?;
+            if tag == CHANGE_QUOTE_OUTPUT {
+                // `01 amount, 02 lock key, 03 quote id`; the remainder quote has no `01`.
+                let (key, id) = match fields.as_slice() {
+                    [(2, key, _), (3, id, _)] if !remainder => {
+                        remainder = true;
+                        (key, id)
+                    }
+                    [(1, amount, _), (2, key, _), (3, id, _)]
+                        if !amount.is_empty() && amount.len() <= 8 && amount[0] != 0 =>
+                    {
+                        (key, id)
+                    }
+                    _ => return Err(Error::InvalidTransaction),
+                };
+                let key = crate::nuts::PublicKey::from_slice(key)
+                    .map_err(|_| Error::InvalidTransaction)?;
+                // A derived id is 64 lowercase hex characters (NUT-04).
+                let derived =
+                    id.len() == 64 && id.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+                if !matches!(key, crate::nuts::PublicKey::Secp256k1(_))
+                    || !derived
+                    || !change_ids.insert(*id)
+                {
+                    return Err(Error::InvalidTransaction);
+                }
+                output = true;
+                continue;
+            }
             let count = match tag {
                 PROOF_INPUT => 4,
                 MELT_QUOTE_OUTPUT => 2,
