@@ -398,7 +398,7 @@ pub trait QuotesTransaction {
         state: crate::nuts::TransactionState,
     ) -> Result<(), Self::Err>;
 
-    /// Claim mint quote ids for an accepted transaction, tagged with its melt quote if any.
+    /// Claim fixed txout quote ids for an accepted transaction, tagged with its melt quote if any.
     ///
     /// Returns a duplicate error if any id is already claimed or names a mint quote.
     async fn claim_mint_quote_ids(

@@ -821,38 +821,51 @@ fn shared_transcript_vectors() {
         if let Some(expected) = case.get("input_section_hash") {
             assert_eq!(<[u8; 32]>::from(Sha256::digest(&section)), hash(expected));
         }
-        let change: Vec<_> = list(&tx["change_quote_outputs"])
+        // The remainder quote is named by its melt, a fixed one by its preimage or its inputs.
+        let quote_outputs: Vec<_> = list(&tx["mint_quote_outputs"])
             .iter()
             .enumerate()
-            .map(|(k, v)| ChangeOutput {
+            .map(|(k, v)| MintQuoteOutput {
                 amount: v["amount"].as_u64().map(Into::into),
                 pubkey: *crate::nuts::PublicKey::from_hex(v["pubkey"].as_str().unwrap())
                     .unwrap()
                     .as_secp256k1()
                     .unwrap(),
-                id: match v.get("id_preimage") {
-                    Some(preimage) => derived_quote_id(&hash(preimage)),
-                    None => input_bound_quote_id(&section, k as u32),
+                id: match (v.get("amount"), v.get("id_preimage")) {
+                    (None, _) => remainder_quote_id(&melt_quotes[0].id),
+                    (Some(_), Some(preimage)) => derived_quote_id(&hash(preimage)),
+                    (Some(_), None) => input_bound_quote_id(&section, k as u32),
                 },
             })
             .collect();
-        let transaction =
-            Transaction::with_change(&proofs, &mint_quotes, &outputs, &melt_quotes, &change)
-                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let transaction = Transaction::with_quote_outputs(
+            &proofs,
+            &mint_quotes,
+            &outputs,
+            &melt_quotes,
+            &quote_outputs,
+        )
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
         let expected_ids: Vec<String> = match (&case["quote_id"], &case["quote_ids"]) {
-            (Value::String(id), _) => vec![id.clone()],
+            (Value::String(id), _) if !quote_outputs.is_empty() => vec![id.clone()],
             (_, Value::Array(ids)) => ids.iter().map(|v| v.as_str().unwrap().to_owned()).collect(),
             _ => vec![],
         };
         assert_eq!(
-            change.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+            quote_outputs
+                .iter()
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>(),
             expected_ids,
             "{name}"
         );
-        // Change containers are the transcript's last records.
-        let containers: Vec<u8> = match &case["change_containers"] {
+        // Mint quote output containers are the transcript's last records.
+        let containers: Vec<u8> = match &case["mint_quote_output_containers"] {
             Value::Array(all) => all.iter().flat_map(bytes).collect(),
-            _ => case.get("change_container").map(bytes).unwrap_or_default(),
+            _ => case
+                .get("mint_quote_output_container")
+                .map(bytes)
+                .unwrap_or_default(),
         };
         assert!(transaction.as_bytes().ends_with(&containers), "{name}");
         assert_eq!(transaction.as_bytes(), bytes(&case["transcript"]), "{name}");
@@ -863,8 +876,10 @@ fn shared_transcript_vectors() {
             "{name}"
         );
         assert_eq!(
-            transaction.change_keys().is_some(),
-            outputs.is_empty() && melt_quotes.is_empty(),
+            transaction.txout_keys().is_some(),
+            outputs.is_empty()
+                && melt_quotes.is_empty()
+                && quote_outputs.iter().all(|c| c.amount.is_some()),
             "{name}"
         );
         let inputs: Vec<(usize, &Value)> = match case.get("inputs") {
@@ -963,6 +978,16 @@ fn shared_mint_quote_input_vectors() {
 }
 
 #[test]
+fn remainder_quote_id_vector() {
+    let shared: Value = serde_json::from_str(include_str!("nutroot_v3_vectors.json")).unwrap();
+    let lock = &shared["nut13_v3"]["remainder_lock"];
+    assert_eq!(
+        remainder_quote_id(lock["melt_quote_id"].as_str().unwrap()),
+        lock["quote_id"].as_str().unwrap()
+    );
+}
+
+#[test]
 fn quote_id_preimage_vectors() {
     let shared: Value = serde_json::from_str(include_str!("nutroot_v3_vectors.json")).unwrap();
     let nut13 = &shared["nut13_v3"];
@@ -1005,13 +1030,13 @@ fn template_proofs(tx: &Value) -> Vec<crate::Proof> {
         .collect()
 }
 
-/// A template vector's `tx`: proof inputs and change quote outputs only.
+/// A template vector's `tx`: proof inputs and fixed txout quote outputs only.
 fn template_transaction(tx: &Value) -> Transaction {
-    let change: Vec<_> = tx["change_quote_outputs"]
+    let quote_outputs: Vec<_> = tx["mint_quote_outputs"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|v| ChangeOutput {
+        .map(|v| MintQuoteOutput {
             amount: v["amount"].as_u64().map(Into::into),
             pubkey: *crate::nuts::PublicKey::from_hex(v["pubkey"].as_str().unwrap())
                 .unwrap()
@@ -1020,7 +1045,7 @@ fn template_transaction(tx: &Value) -> Transaction {
             id: derived_quote_id(&hash(&v["id_preimage"])),
         })
         .collect();
-    Transaction::with_change(&template_proofs(tx), &[], &[], &[], &change).unwrap()
+    Transaction::with_quote_outputs(&template_proofs(tx), &[], &[], &[], &quote_outputs).unwrap()
 }
 
 #[test]
@@ -1040,17 +1065,17 @@ fn shared_template_leaf_vectors() {
     assert_eq!(digest, hash(&case["input_digest"]));
     let witness: Witness = serde_json::from_str(case["witness"].as_str().unwrap()).unwrap();
     assert!(!witness
-        .verify_in(secret, digest, transaction.change_keys(), 0)
+        .verify_in(secret, digest, transaction.txout_keys(), 0)
         .unwrap());
     // Without the outputs the leaf cannot be satisfied.
     assert!(witness.verify(secret, digest, 0).is_err());
-    // A change quote to a key outside dests, and a blinded message beside the change quotes,
+    // A txout quote to a key outside dests, and a blinded message beside the txout quotes,
     // each fail the leaf although the signature is good for the digest.
     let mut rejected = case["tx"].clone();
-    rejected["change_quote_outputs"] = case["rejected_outputs"]["change_quote_outputs"].clone();
+    rejected["mint_quote_outputs"] = case["rejected_outputs"]["mint_quote_outputs"].clone();
     let rejected = template_transaction(&rejected);
     assert!(witness
-        .verify_in(secret, digest, rejected.change_keys(), 0)
+        .verify_in(secret, digest, rejected.txout_keys(), 0)
         .is_err());
     let blinded = &shared["transcript"]["swap"]["tx"]["blinded_outputs"][0];
     let blinded = crate::BlindedMessage {
@@ -1059,25 +1084,42 @@ fn shared_template_leaf_vectors() {
         blinded_secret: crate::nuts::PublicKey::from_hex(blinded["B_"].as_str().unwrap()).unwrap(),
         witness: None,
     };
-    let change: Vec<_> = dests
+    let quote_outputs: Vec<_> = dests
         .iter()
         .zip(1u8..)
-        .map(|(pubkey, n)| ChangeOutput {
+        .map(|(pubkey, n)| MintQuoteOutput {
             amount: Some(1.into()),
             pubkey: *pubkey,
             id: derived_quote_id(&[n; 32]),
         })
         .collect();
     let mixed = Transaction::from_bytes(
-        Transaction::with_change(&template_proofs(&case["tx"]), &[], &[blinded], &[], &change)
-            .unwrap()
-            .as_bytes(),
+        Transaction::with_quote_outputs(
+            &template_proofs(&case["tx"]),
+            &[],
+            &[blinded],
+            &[],
+            &quote_outputs,
+        )
+        .unwrap()
+        .as_bytes(),
     )
     .unwrap();
-    assert!(mixed.change_keys().is_none());
+    assert!(mixed.txout_keys().is_none());
     assert!(witness
-        .verify_in(secret, digest, mixed.change_keys(), 0)
+        .verify_in(secret, digest, mixed.txout_keys(), 0)
         .is_err());
+    // A remainder quote is not a fixed txout quote, even to a key in dests.
+    let mut remainder = quote_outputs.clone();
+    remainder[0].amount = None;
+    let remainder =
+        Transaction::with_quote_outputs(&template_proofs(&case["tx"]), &[], &[], &[], &remainder)
+            .unwrap();
+    assert!(remainder.txout_keys().is_none());
+    assert!(Transaction::from_bytes(remainder.as_bytes())
+        .unwrap()
+        .txout_keys()
+        .is_none());
     // dests: at least one valid key, no repeats, on a template leaf only, and no time or hash.
     let keys = leaf.keys().to_vec();
     assert!(Leaf::new(1, keys.clone(), Condition::Template(vec![]), false).is_err());
@@ -1133,13 +1175,13 @@ fn shared_template_escrow_vectors() {
     let witness: Witness = serde_json::from_str(case["witness"].as_str().unwrap()).unwrap();
     let secret = case["secret"].as_str().unwrap();
     assert!(!witness
-        .verify_in(secret, digest, transaction.change_keys(), 0)
+        .verify_in(secret, digest, transaction.txout_keys(), 0)
         .unwrap());
-    // A remainder quote to the arbiter itself is outside dests.
+    // A txout quote to the arbiter itself is outside dests.
     let mut self_deal = case["tx"].clone();
-    self_deal["change_quote_outputs"] = case["self_deal"]["change_quote_outputs"].clone();
+    self_deal["mint_quote_outputs"] = case["self_deal"]["mint_quote_outputs"].clone();
     let self_deal = template_transaction(&self_deal);
     assert!(witness
-        .verify_in(secret, digest, self_deal.change_keys(), 0)
+        .verify_in(secret, digest, self_deal.txout_keys(), 0)
         .is_err());
 }

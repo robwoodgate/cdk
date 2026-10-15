@@ -2041,7 +2041,7 @@ where
             None,
             Amount::new(1, cashu::CurrencyUnit::Sat),
             Amount::new(0, cashu::CurrencyUnit::Sat),
-            cashu::PaymentMethod::Custom("change".to_owned()),
+            cashu::PaymentMethod::Custom("txout".to_owned()),
             0,
             0,
             vec![],

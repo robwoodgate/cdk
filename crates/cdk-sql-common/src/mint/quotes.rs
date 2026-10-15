@@ -165,7 +165,7 @@ pub(super) async fn get_mint_quote_by_request_inner<T>(
 where
     T: DatabaseExecutor,
 {
-    // An empty request names no payment; change quotes all share it.
+    // An empty request names no payment; txout quotes all share it.
     if request.is_empty() {
         return Ok(None);
     }
@@ -668,12 +668,12 @@ fn sql_row_to_melt_quote(row: Vec<Column>) -> Result<mint::MeltQuote, Error> {
 }
 
 const TRANSACTION_COLUMNS: &str =
-    "melt_quote_id, state, unit, quote_inputs, change_outputs, excess, created_time";
+    "melt_quote_id, state, unit, quote_inputs, mint_quote_outputs, excess, created_time";
 
 fn sql_row_to_transaction(row: Vec<Column>) -> Result<mint::TransactionRecord, Error> {
     unpack_into!(
         let (
-            melt_quote_id, state, unit, quote_inputs, change_outputs, excess, created_time
+            melt_quote_id, state, unit, quote_inputs, mint_quote_outputs, excess, created_time
         ) = row
     );
     let state = cdk_common::nuts::TransactionState::from_str(&column_as_string!(&state))
@@ -684,10 +684,10 @@ fn sql_row_to_transaction(row: Vec<Column>) -> Result<mint::TransactionRecord, E
         .into_iter()
         .map(|(id, amount)| Ok((QuoteId::from_str(&id)?, Amount::from(amount))))
         .collect::<Result<Vec<_>, Error>>()?;
-    let change_outputs: Vec<(String, String, Option<u64>)> =
-        serde_json::from_str(&column_as_string!(&change_outputs))
-            .map_err(|e| Error::Internal(format!("Invalid transaction change outputs: {e}")))?;
-    let change_outputs = change_outputs
+    let mint_quote_outputs: Vec<(String, String, Option<u64>)> =
+        serde_json::from_str(&column_as_string!(&mint_quote_outputs))
+            .map_err(|e| Error::Internal(format!("Invalid transaction mint quote outputs: {e}")))?;
+    let mint_quote_outputs = mint_quote_outputs
         .into_iter()
         .map(|(id, key, amount)| {
             Ok((
@@ -703,7 +703,7 @@ fn sql_row_to_transaction(row: Vec<Column>) -> Result<mint::TransactionRecord, E
         state,
         unit: column_as_string!(unit, CurrencyUnit::from_str),
         quote_inputs,
-        change_outputs,
+        mint_quote_outputs,
         excess: Amount::from(excess),
         created_time: column_as_number!(created_time),
     })
@@ -1320,9 +1320,9 @@ where
                 .collect::<Vec<_>>(),
         )
         .map_err(|e| Error::Internal(e.to_string()))?;
-        let change_outputs = serde_json::to_string(
+        let mint_quote_outputs = serde_json::to_string(
             &record
-                .change_outputs
+                .mint_quote_outputs
                 .iter()
                 .map(|(id, key, amount)| (id.to_string(), key.to_hex(), amount.map(u64::from)))
                 .collect::<Vec<_>>(),
@@ -1331,14 +1331,14 @@ where
         let affected = query(
             r#"
             INSERT INTO melt_transaction
-            (melt_quote_id, state, unit, quote_inputs, change_outputs, excess, created_time)
+            (melt_quote_id, state, unit, quote_inputs, mint_quote_outputs, excess, created_time)
             VALUES
-            (:melt_quote_id, :state, :unit, :quote_inputs, :change_outputs, :excess, :created_time)
+            (:melt_quote_id, :state, :unit, :quote_inputs, :mint_quote_outputs, :excess, :created_time)
             ON CONFLICT (melt_quote_id) DO UPDATE SET
                 state = EXCLUDED.state,
                 unit = EXCLUDED.unit,
                 quote_inputs = EXCLUDED.quote_inputs,
-                change_outputs = EXCLUDED.change_outputs,
+                mint_quote_outputs = EXCLUDED.mint_quote_outputs,
                 excess = EXCLUDED.excess,
                 created_time = EXCLUDED.created_time
             WHERE melt_transaction.state = 'FAILED'
@@ -1348,7 +1348,7 @@ where
         .bind("state", record.state.to_string())
         .bind("unit", record.unit.to_string())
         .bind("quote_inputs", quote_inputs)
-        .bind("change_outputs", change_outputs)
+        .bind("mint_quote_outputs", mint_quote_outputs)
         .bind("excess", record.excess.to_i64())
         .bind("created_time", record.created_time as i64)
         .execute(&self.inner)

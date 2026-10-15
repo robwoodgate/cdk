@@ -13,7 +13,7 @@ const PROOF_INPUT: u8 = 0x11;
 const MINT_QUOTE_INPUT: u8 = 0x12;
 const BLINDED_OUTPUT: u8 = 0x21;
 const MELT_QUOTE_OUTPUT: u8 = 0x22;
-const CHANGE_QUOTE_OUTPUT: u8 = 0x23;
+const MINT_QUOTE_OUTPUT: u8 = 0x23;
 const AUTHORIZED_REQUEST: u8 = 0xf1;
 
 /// Quote identity and amount bound by a transaction.
@@ -40,14 +40,15 @@ pub struct MintQuoteInput {
     pub issued: Amount,
 }
 
-/// Change quote output bound by a transaction.
+/// Mint quote output bound by a transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChangeOutput {
-    /// Fixed amount, or `None` for the remainder quote that takes the balance.
+pub struct MintQuoteOutput {
+    /// Fixed amount, `None` on the remainder quote.
     pub amount: Option<Amount>,
-    /// Lock key of the change quote.
+    /// Lock key of the txout quote.
     pub pubkey: bitcoin::secp256k1::PublicKey,
-    /// The change quote's id: [`super::derived_quote_id`] or [`super::input_bound_quote_id`].
+    /// The txout quote's id: [`super::derived_quote_id`] or [`super::input_bound_quote_id`] for a
+    /// fixed one, [`super::remainder_quote_id`] for the remainder quote.
     pub id: String,
 }
 
@@ -57,7 +58,7 @@ pub struct Transaction {
     transcript: Vec<u8>,
     inputs: Vec<Vec<u8>>,
     digest: [u8; 32],
-    change_keys: Option<Vec<bitcoin::secp256k1::PublicKey>>,
+    txout_keys: Option<Vec<bitcoin::secp256k1::PublicKey>>,
 }
 
 impl Transaction {
@@ -69,21 +70,21 @@ impl Transaction {
         outputs: &[BlindedMessage],
         melt_quotes: &[Quote],
     ) -> Result<Self, Error> {
-        Self::with_change(proofs, mint_quotes, outputs, melt_quotes, &[])
+        Self::with_quote_outputs(proofs, mint_quotes, outputs, melt_quotes, &[])
     }
 
-    /// [`Transaction::new`] with change quote outputs, at most one of them the remainder.
-    pub fn with_change(
+    /// [`Transaction::new`] with mint quote outputs, at most one of them the remainder.
+    pub fn with_quote_outputs(
         proofs: &[Proof],
         mint_quotes: &[MintQuoteInput],
         outputs: &[BlindedMessage],
         melt_quotes: &[Quote],
-        change: &[ChangeOutput],
+        quote_outputs: &[MintQuoteOutput],
     ) -> Result<Self, Error> {
         if (proofs.is_empty() && mint_quotes.is_empty())
-            || (outputs.is_empty() && melt_quotes.is_empty() && change.is_empty())
-            || change.iter().filter(|c| c.amount.is_none()).count() > 1
-            || change.iter().any(|c| c.amount == Some(Amount::ZERO))
+            || (outputs.is_empty() && melt_quotes.is_empty() && quote_outputs.is_empty())
+            || quote_outputs.iter().filter(|c| c.amount.is_none()).count() > 1
+            || quote_outputs.iter().any(|c| c.amount == Some(Amount::ZERO))
         {
             return Err(Error::InvalidTransaction);
         }
@@ -108,7 +109,7 @@ impl Transaction {
                 ],
             )?);
         }
-        for output in change {
+        for output in quote_outputs {
             // The amount record is omitted entirely on the remainder quote.
             let mut body = vec![];
             if let Some(amount) = output.amount {
@@ -116,11 +117,13 @@ impl Transaction {
             }
             record(&mut body, 2, &output.pubkey.serialize())?;
             record(&mut body, 3, output.id.as_bytes())?;
-            record(&mut transcript, CHANGE_QUOTE_OUTPUT, &body)?;
+            record(&mut transcript, MINT_QUOTE_OUTPUT, &body)?;
         }
-        let change_keys = (outputs.is_empty() && melt_quotes.is_empty())
-            .then(|| change.iter().map(|output| output.pubkey).collect());
-        Ok(Self::from_parts(transcript, inputs, change_keys))
+        let txout_keys = (outputs.is_empty()
+            && melt_quotes.is_empty()
+            && quote_outputs.iter().all(|output| output.amount.is_some()))
+        .then(|| quote_outputs.iter().map(|output| output.pubkey).collect());
+        Ok(Self::from_parts(transcript, inputs, txout_keys))
     }
 
     /// Parse a canonical transaction transcript for receipt verification.
@@ -135,19 +138,20 @@ impl Transaction {
         let mut quotes = HashSet::new();
         let mut output = false;
         let mut remainder = false;
-        let mut change_ids = HashSet::new();
-        let mut change_keys = Some(vec![]);
+        let mut quote_output_ids = HashSet::new();
+        let mut txout_keys = Some(vec![]);
         for (tag, value, full) in records {
             if tag < last || !matches!(tag >> 4, 1 | 2) {
                 return Err(Error::InvalidTransaction);
             }
             last = tag;
             let fields = parse_records(value)?;
-            if tag == CHANGE_QUOTE_OUTPUT {
+            if tag == MINT_QUOTE_OUTPUT {
                 // `01 amount, 02 lock key, 03 quote id`; the remainder quote has no `01`.
                 let (key, id) = match fields.as_slice() {
                     [(2, key, _), (3, id, _)] if !remainder => {
                         remainder = true;
+                        txout_keys = None;
                         (key, id)
                     }
                     [(1, amount, _), (2, key, _), (3, id, _)]
@@ -165,10 +169,10 @@ impl Transaction {
                 let crate::nuts::PublicKey::Secp256k1(key) = key else {
                     return Err(Error::InvalidTransaction);
                 };
-                if !derived || !change_ids.insert(*id) {
+                if !derived || !quote_output_ids.insert(*id) {
                     return Err(Error::InvalidTransaction);
                 }
-                if let Some(keys) = change_keys.as_mut() {
+                if let Some(keys) = txout_keys.as_mut() {
                     keys.push(key);
                 }
                 output = true;
@@ -240,26 +244,26 @@ impl Transaction {
                 inputs.push(full.to_vec());
             } else {
                 output = true;
-                change_keys = None;
+                txout_keys = None;
             }
         }
         if inputs.is_empty() || !output {
             return Err(Error::InvalidTransaction);
         }
-        Ok(Self::from_parts(bytes.to_vec(), inputs, change_keys))
+        Ok(Self::from_parts(bytes.to_vec(), inputs, txout_keys))
     }
 
     fn from_parts(
         transcript: Vec<u8>,
         inputs: Vec<Vec<u8>>,
-        change_keys: Option<Vec<bitcoin::secp256k1::PublicKey>>,
+        txout_keys: Option<Vec<bitcoin::secp256k1::PublicKey>>,
     ) -> Self {
         let digest = Sha256::digest(&transcript).into();
         Self {
             transcript,
             inputs,
             digest,
-            change_keys,
+            txout_keys,
         }
     }
 
@@ -286,9 +290,9 @@ impl Transaction {
     pub fn as_bytes(&self) -> &[u8] {
         &self.transcript
     }
-    /// Lock keys of the change quote outputs, or `None` when any output is another type.
-    pub fn change_keys(&self) -> Option<&[bitcoin::secp256k1::PublicKey]> {
-        self.change_keys.as_deref()
+    /// Lock keys of the fixed txout quote outputs, or `None` when any output is another type.
+    pub fn txout_keys(&self) -> Option<&[bitcoin::secp256k1::PublicKey]> {
+        self.txout_keys.as_deref()
     }
     /// Shared transaction digest, which is not itself a signing message.
     pub fn digest(&self) -> [u8; 32] {

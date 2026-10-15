@@ -476,9 +476,9 @@ impl MeltSaga<Initial> {
 
         if let Some(setup) = transaction {
             let record = &setup.record;
-            if let Err(err) = crate::mint::transaction::claim_change_quote_ids(
+            if let Err(err) = crate::mint::transaction::claim_txout_quote_ids(
                 &mut tx,
-                &record.change_outputs,
+                &record.mint_quote_outputs,
                 Some(&record.melt_quote_id),
             )
             .await
